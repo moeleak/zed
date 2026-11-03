@@ -1,7 +1,7 @@
 use crate::{
     Capslock, KeyDownEvent, KeyUpEvent, Keystroke, Modifiers, ModifiersChangedEvent, MouseButton,
     MouseDownEvent, MouseExitEvent, MouseMoveEvent, MouseUpEvent, NavigationDirection, Pixels,
-    PlatformInput, ScrollDelta, ScrollWheelEvent, TouchPhase,
+    PlatformInput, PointerType, ScrollDelta, ScrollWheelEvent, TouchPhase,
     platform::mac::{
         LMGetKbdType, NSStringExt, TISCopyCurrentKeyboardLayoutInputSource,
         TISGetInputSourceProperty, UCKeyTranslate, kTISPropertyUnicodeKeyLayoutData,
@@ -158,6 +158,8 @@ impl PlatformInput {
                             modifiers: read_modifiers(native_event),
                             click_count: native_event.clickCount() as usize,
                             first_mouse: false,
+                            pointer_type: PointerType::Mouse,
+                            pressure: None,
                         })
                     })
                 }
@@ -183,6 +185,8 @@ impl PlatformInput {
                             ),
                             modifiers: read_modifiers(native_event),
                             click_count: native_event.clickCount() as usize,
+                            pointer_type: PointerType::Mouse,
+                            pressure: None,
                         })
                     })
                 }
@@ -208,6 +212,8 @@ impl PlatformInput {
                                 modifiers: read_modifiers(native_event),
                                 click_count: 1,
                                 first_mouse: false,
+                                pointer_type: PointerType::Mouse,
+                                pressure: None,
                             })
                         }),
                         _ => None,
@@ -264,6 +270,8 @@ impl PlatformInput {
                                 window_height - px(native_event.locationInWindow().y as f32),
                             ),
                             modifiers: read_modifiers(native_event),
+                            pointer_type: PointerType::Mouse,
+                            pressure: None,
                         })
                     })
                 }
@@ -275,6 +283,8 @@ impl PlatformInput {
                         ),
                         pressed_button: None,
                         modifiers: read_modifiers(native_event),
+                        pointer_type: PointerType::Mouse,
+                        pressure: None,
                     })
                 }),
                 NSEventType::NSMouseExited => window_height.map(|window_height| {
@@ -286,6 +296,8 @@ impl PlatformInput {
 
                         pressed_button: None,
                         modifiers: read_modifiers(native_event),
+                        pointer_type: PointerType::Mouse,
+                        pressure: None,
                     })
                 }),
                 _ => None,

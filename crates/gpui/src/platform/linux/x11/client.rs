@@ -62,8 +62,9 @@ use crate::platform::{
 use crate::{
     AnyWindowHandle, Bounds, ClipboardItem, CursorStyle, DisplayId, FileDropEvent, Keystroke,
     LinuxKeyboardLayout, Modifiers, ModifiersChangedEvent, MouseButton, Pixels, Platform,
-    PlatformDisplay, PlatformInput, PlatformKeyboardLayout, Point, RequestFrameOptions,
-    ScrollDelta, Size, TouchPhase, WindowParams, X11Window, modifiers_from_xinput_info, point, px,
+    PlatformDisplay, PlatformInput, PlatformKeyboardLayout, Point, PointerType,
+    RequestFrameOptions, ScrollDelta, Size, TouchPhase, WindowParams, X11Window,
+    modifiers_from_xinput_info, point, px,
 };
 
 /// Value for DeviceId parameters which selects all devices.
@@ -148,10 +149,33 @@ pub struct Xdnd {
     position: Point<Pixels>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
+struct PressureAxisState {
+    /// Valuator number of the pressure axis.
+    number: Option<u16>,
+    min: f32,
+    max: f32,
+}
+
+impl PressureAxisState {
+    /// Reads and normalizes the pressure carried by an XI2 event.
+    fn value(&self, valuator_mask: &[u32], axisvalues: &[xinput::Fp3232]) -> Option<f32> {
+        let axis_index = get_valuator_axis_index(valuator_mask, self.number?)?;
+        let value = fp3232_to_f32(*axisvalues.get(axis_index)?);
+        let range = self.max - self.min;
+        if range <= 0.0 {
+            return Some(value.clamp(0.0, 1.0));
+        }
+        Some(((value - self.min) / range).clamp(0.0, 1.0))
+    }
+}
+
+#[derive(Debug, Default)]
 struct PointerDeviceState {
     horizontal: ScrollAxisState,
     vertical: ScrollAxisState,
+    pressure: PressureAxisState,
+    pointer_type: PointerType,
 }
 
 #[derive(Debug, Default)]
@@ -1116,6 +1140,11 @@ impl X11Client {
                         state.last_mouse_button = Some(button);
                         state.last_location = position;
                         let current_count = state.current_count;
+                        let pointer = state.pointer_device_states.get(&event.sourceid);
+                        let pointer_type = pointer.map_or(PointerType::Unknown, |p| p.pointer_type);
+                        let pressure = pointer.and_then(|p| {
+                            p.pressure.value(&event.valuator_mask, &event.axisvalues)
+                        });
 
                         drop(state);
                         window.handle_input(PlatformInput::MouseDown(crate::MouseDownEvent {
@@ -1124,6 +1153,8 @@ impl X11Client {
                             modifiers,
                             click_count: current_count,
                             first_mouse: false,
+                            pointer_type,
+                            pressure,
                         }));
                     }
                     Some(ButtonOrScroll::Scroll(direction)) => {
@@ -1163,12 +1194,19 @@ impl X11Client {
                 match button_or_scroll_from_event_detail(event.detail) {
                     Some(ButtonOrScroll::Button(button)) => {
                         let click_count = state.current_count;
+                        let pointer = state.pointer_device_states.get(&event.sourceid);
+                        let pointer_type = pointer.map_or(PointerType::Unknown, |p| p.pointer_type);
+                        let pressure = pointer.and_then(|p| {
+                            p.pressure.value(&event.valuator_mask, &event.axisvalues)
+                        });
                         drop(state);
                         window.handle_input(PlatformInput::MouseUp(crate::MouseUpEvent {
                             button,
                             position,
                             modifiers,
                             click_count,
+                            pointer_type,
+                            pressure,
                         }));
                     }
                     Some(ButtonOrScroll::Scroll(_)) => {}
@@ -1185,13 +1223,22 @@ impl X11Client {
                 );
                 let modifiers = modifiers_from_xinput_info(event.mods);
                 state.modifiers = modifiers;
+                let pointer = state.pointer_device_states.get(&event.sourceid);
+                let pointer_type = pointer.map_or(PointerType::Unknown, |p| p.pointer_type);
+                let pressure =
+                    pointer.and_then(|p| p.pressure.value(&event.valuator_mask, &event.axisvalues));
+                let has_motion = event.valuator_mask[0] & 3 != 0;
                 drop(state);
 
-                if event.valuator_mask[0] & 3 != 0 {
+                // Pressure can change without the pen moving, so send a move
+                // for those events too.
+                if has_motion || pressure.is_some() {
                     window.handle_input(PlatformInput::MouseMove(crate::MouseMoveEvent {
                         position,
                         pressed_button,
                         modifiers,
+                        pointer_type,
+                        pressure,
                     }));
                 }
 
@@ -1234,6 +1281,8 @@ impl X11Client {
                     pressed_button,
                     position,
                     modifiers,
+                    pointer_type: PointerType::Unknown,
+                    pressure: None,
                 }));
                 window.set_hovered(false);
             }
@@ -2101,7 +2150,7 @@ fn current_pointer_device_states(
             .infos
             .iter()
             .filter(|info| is_pointer_device(info.type_))
-            .filter_map(|info| {
+            .map(|info| {
                 let scroll_data = info
                     .classes
                     .iter()
@@ -2120,17 +2169,46 @@ fn current_pointer_device_states(
                     .iter()
                     .find(|data| data.scroll_type == xinput::ScrollType::VERTICAL)
                     .map(|data| scroll_data_to_axis_state(data, old_vertical));
-                if horizontal.is_none() && vertical.is_none() {
-                    None
+
+                // Stylus pressure. Valuator 2 is ABS_PRESSURE in XI2; the
+                // class carries the real range, which is not always 0..65535.
+                let pressure = info
+                    .classes
+                    .iter()
+                    .filter_map(|class| class.data.as_valuator())
+                    .find(|data| data.number == 2)
+                    .map(|data| PressureAxisState {
+                        number: Some(data.number),
+                        min: fp3232_to_f32(data.min),
+                        max: fp3232_to_f32(data.max),
+                    })
+                    .unwrap_or_default();
+                let device_name = String::from_utf8_lossy(&info.name).to_lowercase();
+                let pointer_type = if pressure.number.is_some() {
+                    if device_name.contains("eraser") {
+                        PointerType::PenEraser
+                    } else {
+                        PointerType::Pen
+                    }
+                } else if info
+                    .classes
+                    .iter()
+                    .any(|class| matches!(class.data, xinput::DeviceClassData::Touch(_)))
+                {
+                    PointerType::Touch
                 } else {
-                    Some((
-                        info.deviceid,
-                        PointerDeviceState {
-                            horizontal: horizontal.unwrap_or_else(Default::default),
-                            vertical: vertical.unwrap_or_else(Default::default),
-                        },
-                    ))
-                }
+                    PointerType::Mouse
+                };
+
+                (
+                    info.deviceid,
+                    PointerDeviceState {
+                        horizontal: horizontal.unwrap_or_else(Default::default),
+                        vertical: vertical.unwrap_or_else(Default::default),
+                        pressure,
+                        pointer_type,
+                    },
+                )
             }),
     );
     if pointer_device_states.is_empty() {

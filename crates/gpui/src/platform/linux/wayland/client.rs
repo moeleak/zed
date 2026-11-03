@@ -1,6 +1,7 @@
 use std::{
     cell::{RefCell, RefMut},
     hash::Hash,
+    mem,
     os::fd::{AsRawFd, BorrowedFd},
     path::PathBuf,
     rc::{Rc, Weak},
@@ -49,6 +50,9 @@ use wayland_protocols::wp::primary_selection::zv1::client::{
     zwp_primary_selection_device_manager_v1, zwp_primary_selection_device_v1,
     zwp_primary_selection_source_v1,
 };
+use wayland_protocols::wp::tablet::zv2::client::{
+    zwp_tablet_manager_v2, zwp_tablet_pad_v2, zwp_tablet_seat_v2, zwp_tablet_tool_v2, zwp_tablet_v2,
+};
 use wayland_protocols::wp::text_input::zv3::client::zwp_text_input_v3::{
     ContentHint, ContentPurpose,
 };
@@ -76,8 +80,8 @@ use crate::{
     FileDropEvent, ForegroundExecutor, KeyDownEvent, KeyUpEvent, Keystroke, LinuxCommon,
     LinuxKeyboardLayout, Modifiers, ModifiersChangedEvent, MouseButton, MouseDownEvent,
     MouseExitEvent, MouseMoveEvent, MouseUpEvent, NavigationDirection, Pixels, PlatformDisplay,
-    PlatformInput, PlatformKeyboardLayout, Point, SCROLL_LINES, ScrollDelta, ScrollWheelEvent,
-    Size, TouchPhase, WindowParams, point, px, size,
+    PlatformInput, PlatformKeyboardLayout, Point, PointerType, SCROLL_LINES, ScrollDelta,
+    ScrollWheelEvent, Size, TouchPhase, WindowParams, point, px, size,
 };
 use crate::{
     SharedString,
@@ -117,6 +121,7 @@ pub struct Globals {
     pub decoration_manager: Option<zxdg_decoration_manager_v1::ZxdgDecorationManagerV1>,
     pub blur_manager: Option<org_kde_kwin_blur_manager::OrgKdeKwinBlurManager>,
     pub text_input_manager: Option<zwp_text_input_manager_v3::ZwpTextInputManagerV3>,
+    pub tablet_manager: Option<zwp_tablet_manager_v2::ZwpTabletManagerV2>,
     pub executor: ForegroundExecutor,
 }
 
@@ -154,6 +159,7 @@ impl Globals {
             decoration_manager: globals.bind(&qh, 1..=1, ()).ok(),
             blur_manager: globals.bind(&qh, 1..=1, ()).ok(),
             text_input_manager: globals.bind(&qh, 1..=1, ()).ok(),
+            tablet_manager: globals.bind(&qh, 1..=1, ()).ok(),
             executor,
             qh,
         }
@@ -197,6 +203,8 @@ pub(crate) struct WaylandClientState {
     wl_seat: wl_seat::WlSeat, // TODO: Multi seat support
     wl_pointer: Option<wl_pointer::WlPointer>,
     wl_keyboard: Option<wl_keyboard::WlKeyboard>,
+    tablet_seat: Option<zwp_tablet_seat_v2::ZwpTabletSeatV2>,
+    tablet_tools: HashMap<ObjectId, TabletToolState>,
     cursor_shape_device: Option<wp_cursor_shape_device_v1::WpCursorShapeDeviceV1>,
     data_device: Option<wl_data_device::WlDataDevice>,
     primary_selection: Option<zwp_primary_selection_device_v1::ZwpPrimarySelectionDeviceV1>,
@@ -243,6 +251,169 @@ pub struct DragState {
     data_offer: Option<wl_data_offer::WlDataOffer>,
     window: Option<WaylandWindowStatePtr>,
     position: Point<Pixels>,
+}
+
+#[derive(Default)]
+pub struct TabletToolState {
+    pointer_type: PointerType,
+    surface: Option<ObjectId>,
+    position: Point<Pixels>,
+    pressure: Option<f32>,
+    down: bool,
+    barrel_button: Option<MouseButton>,
+    frame: TabletToolFrame,
+}
+
+/// What changed since the last `frame` event. The compositor splits one
+/// hardware event into several protocol events (a touch arrives as `motion`,
+/// `down`, `pressure`, `frame`), so they are only turned into GPUI events once
+/// the frame is complete.
+#[derive(Default)]
+struct TabletToolFrame {
+    proximity_out: bool,
+    /// `Some(true)` when the tip touched the surface, `Some(false)` when it
+    /// lifted.
+    tip_down: Option<bool>,
+    motion: bool,
+    pressure: bool,
+    buttons: SmallVec<[(MouseButton, bool); 2]>,
+}
+
+impl TabletToolState {
+    fn pressed_button(&self) -> Option<MouseButton> {
+        if self.down {
+            Some(MouseButton::Left)
+        } else {
+            self.barrel_button
+        }
+    }
+
+    fn handle_event(
+        &mut self,
+        event: zwp_tablet_tool_v2::Event,
+        modifiers: Modifiers,
+    ) -> SmallVec<[PlatformInput; 4]> {
+        match event {
+            zwp_tablet_tool_v2::Event::Type {
+                tool_type: WEnum::Value(tool_type),
+            } => {
+                self.pointer_type = match tool_type {
+                    zwp_tablet_tool_v2::Type::Eraser => PointerType::PenEraser,
+                    zwp_tablet_tool_v2::Type::Finger => PointerType::Touch,
+                    _ => PointerType::Pen,
+                };
+            }
+            zwp_tablet_tool_v2::Event::ProximityIn { surface, .. } => {
+                self.surface = Some(surface.id());
+                self.down = false;
+                self.barrel_button = None;
+            }
+            zwp_tablet_tool_v2::Event::ProximityOut => {
+                // The surface is kept on purpose: KWin can move a tool that is
+                // already in proximity onto our surface and resume motion and
+                // down events there without sending a new proximity_in.
+                self.frame.proximity_out = true;
+            }
+            zwp_tablet_tool_v2::Event::Down { .. } => self.frame.tip_down = Some(true),
+            zwp_tablet_tool_v2::Event::Up => self.frame.tip_down = Some(false),
+            zwp_tablet_tool_v2::Event::Motion { x, y } => {
+                self.position = point(px(x as f32), px(y as f32));
+                self.frame.motion = true;
+            }
+            zwp_tablet_tool_v2::Event::Pressure { pressure } => {
+                self.pressure = Some(pressure as f32 / 65535.0);
+                self.frame.pressure = true;
+            }
+            zwp_tablet_tool_v2::Event::Button {
+                button,
+                state: WEnum::Value(button_state),
+                ..
+            } => {
+                let pressed = match button_state {
+                    zwp_tablet_tool_v2::ButtonState::Pressed => true,
+                    zwp_tablet_tool_v2::ButtonState::Released => false,
+                    _ => return SmallVec::new(),
+                };
+                if let Some(button) = tablet_button_to_gpui(button) {
+                    self.frame.buttons.push((button, pressed));
+                }
+            }
+            zwp_tablet_tool_v2::Event::Frame { .. } => return self.finish_frame(modifiers),
+            _ => {}
+        }
+        SmallVec::new()
+    }
+
+    fn finish_frame(&mut self, modifiers: Modifiers) -> SmallVec<[PlatformInput; 4]> {
+        let frame = mem::take(&mut self.frame);
+        let mut inputs = SmallVec::new();
+        let button_down = |tool: &Self, button| {
+            PlatformInput::MouseDown(MouseDownEvent {
+                button,
+                position: tool.position,
+                modifiers,
+                click_count: 1,
+                first_mouse: false,
+                pointer_type: tool.pointer_type,
+                pressure: tool.pressure,
+            })
+        };
+        let button_up = |tool: &Self, button| {
+            PlatformInput::MouseUp(MouseUpEvent {
+                button,
+                position: tool.position,
+                modifiers,
+                click_count: 1,
+                pointer_type: tool.pointer_type,
+                pressure: tool.pressure,
+            })
+        };
+
+        // Lift the tip before the frame's motion and touch down after it, so
+        // a stroke neither gets a point at the zero pressure of the lift nor
+        // starts with the zero pressure of the hover before the touch.
+        if frame.tip_down == Some(false) && self.down {
+            self.down = false;
+            inputs.push(button_up(self, MouseButton::Left));
+        }
+        if frame.motion || (frame.pressure && self.down) {
+            inputs.push(PlatformInput::MouseMove(MouseMoveEvent {
+                position: self.position,
+                pressed_button: self.pressed_button(),
+                modifiers,
+                pointer_type: self.pointer_type,
+                pressure: self.pressure,
+            }));
+        }
+        if frame.tip_down == Some(true) && !self.down {
+            self.down = true;
+            inputs.push(button_down(self, MouseButton::Left));
+        }
+
+        for (button, pressed) in frame.buttons {
+            if pressed {
+                self.barrel_button = Some(button);
+                inputs.push(button_down(self, button));
+            } else {
+                if self.barrel_button == Some(button) {
+                    self.barrel_button = None;
+                }
+                inputs.push(button_up(self, button));
+            }
+        }
+
+        if frame.proximity_out {
+            let held = self.down.then_some(MouseButton::Left);
+            for button in held.into_iter().chain(self.barrel_button) {
+                inputs.push(button_up(self, button));
+            }
+            self.down = false;
+            self.barrel_button = None;
+            self.pressure = None;
+        }
+
+        inputs
+    }
 }
 
 pub struct ClickState {
@@ -557,6 +728,8 @@ impl WaylandClient {
             wl_seat: seat,
             wl_pointer: None,
             wl_keyboard: None,
+            tablet_seat: None,
+            tablet_tools: HashMap::default(),
             cursor_shape_device: None,
             data_device,
             primary_selection,
@@ -620,6 +793,19 @@ impl WaylandClient {
         WaylandSource::new(conn, event_queue)
             .insert(handle)
             .unwrap();
+
+        // Tablets are a separate device family from the pointer. The manager
+        // is optional; compositors without tablet support simply do not
+        // advertise it.
+        let tablet_seat = {
+            let state = state.borrow();
+            state
+                .globals
+                .tablet_manager
+                .as_ref()
+                .map(|manager| manager.get_tablet_seat(&state.wl_seat, &qh, ()))
+        };
+        state.borrow_mut().tablet_seat = tablet_seat;
 
         Self(state)
     }
@@ -948,6 +1134,9 @@ delegate_noop!(WaylandClientStatePtr: ignore zxdg_decoration_manager_v1::ZxdgDec
 delegate_noop!(WaylandClientStatePtr: ignore org_kde_kwin_blur_manager::OrgKdeKwinBlurManager);
 delegate_noop!(WaylandClientStatePtr: ignore zwp_text_input_manager_v3::ZwpTextInputManagerV3);
 delegate_noop!(WaylandClientStatePtr: ignore org_kde_kwin_blur::OrgKdeKwinBlur);
+delegate_noop!(WaylandClientStatePtr: ignore zwp_tablet_manager_v2::ZwpTabletManagerV2);
+delegate_noop!(WaylandClientStatePtr: ignore zwp_tablet_v2::ZwpTabletV2);
+delegate_noop!(WaylandClientStatePtr: ignore zwp_tablet_pad_v2::ZwpTabletPadV2);
 delegate_noop!(WaylandClientStatePtr: ignore wp_viewporter::WpViewporter);
 delegate_noop!(WaylandClientStatePtr: ignore wp_viewport::WpViewport);
 
@@ -1133,6 +1322,101 @@ impl Dispatch<xdg_activation_token_v1::XdgActivationTokenV1, ()> for WaylandClie
         }
 
         token.destroy();
+    }
+}
+
+impl Dispatch<zwp_tablet_seat_v2::ZwpTabletSeatV2, ()> for WaylandClientStatePtr {
+    fn event(
+        this: &mut Self,
+        _: &zwp_tablet_seat_v2::ZwpTabletSeatV2,
+        event: zwp_tablet_seat_v2::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        match event {
+            zwp_tablet_seat_v2::Event::ToolAdded { id } => {
+                let client = this.get_client();
+                client
+                    .borrow_mut()
+                    .tablet_tools
+                    .insert(id.id(), TabletToolState::default());
+            }
+            _ => {}
+        }
+    }
+
+    event_created_child!(WaylandClientStatePtr, zwp_tablet_seat_v2::ZwpTabletSeatV2, [
+        zwp_tablet_seat_v2::EVT_TABLET_ADDED_OPCODE => (zwp_tablet_v2::ZwpTabletV2, ()),
+        zwp_tablet_seat_v2::EVT_TOOL_ADDED_OPCODE => (zwp_tablet_tool_v2::ZwpTabletToolV2, ()),
+        zwp_tablet_seat_v2::EVT_PAD_ADDED_OPCODE => (zwp_tablet_pad_v2::ZwpTabletPadV2, ()),
+    ]);
+}
+
+impl Dispatch<zwp_tablet_tool_v2::ZwpTabletToolV2, ()> for WaylandClientStatePtr {
+    fn event(
+        this: &mut Self,
+        tool: &zwp_tablet_tool_v2::ZwpTabletToolV2,
+        event: zwp_tablet_tool_v2::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        let client = this.get_client();
+        let mut state = client.borrow_mut();
+        let id = tool.id();
+        log::trace!("wayland tablet tool event: {event:?}");
+
+        if matches!(event, zwp_tablet_tool_v2::Event::Removed) {
+            state.tablet_tools.remove(&id);
+            return;
+        }
+
+        let modifiers = state.modifiers;
+        let Some(tool_state) = state.tablet_tools.get_mut(&id) else {
+            return;
+        };
+
+        let inputs = tool_state.handle_event(event, modifiers);
+        if inputs.is_empty() {
+            return;
+        }
+        let surface = tool_state.surface.clone();
+        // A tool that is already in proximity when it moves onto our surface
+        // (e.g. from the title bar) gets no proximity_in from KWin, yet its
+        // events are still sent to us. Guess the window instead of dropping
+        // them.
+        let Some(window) = surface
+            .as_ref()
+            .and_then(|surface| state.windows.get(surface).cloned())
+            .or_else(|| state.keyboard_focused_window.clone())
+            .or_else(|| {
+                let mut windows = state.windows.values();
+                let window = windows.next()?;
+                windows.next().is_none().then(|| window.clone())
+            })
+        else {
+            return;
+        };
+
+        drop(state);
+        for input in inputs {
+            window.handle_input(input);
+        }
+    }
+}
+
+fn tablet_button_to_gpui(button: u32) -> Option<MouseButton> {
+    // These values are coming from <linux/input-event-codes.h>.
+    const BTN_STYLUS: u32 = 0x14b;
+    const BTN_STYLUS2: u32 = 0x14c;
+
+    // Same mapping as X11 tablet drivers, which report the lower barrel
+    // button as button 2 and the upper one as button 3.
+    match button {
+        BTN_STYLUS => Some(MouseButton::Middle),
+        BTN_STYLUS2 => Some(MouseButton::Right),
+        _ => linux_button_to_gpui(button),
     }
 }
 
@@ -1565,6 +1849,8 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandClientStatePtr {
                         position: state.mouse_location.unwrap(),
                         pressed_button: state.button_pressed,
                         modifiers: state.modifiers,
+                        pointer_type: crate::PointerType::Mouse,
+                        pressure: None,
                     });
                     state.mouse_focused_window = None;
                     state.mouse_location = None;
@@ -1597,6 +1883,8 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandClientStatePtr {
                         position: state.mouse_location.unwrap(),
                         pressed_button: state.button_pressed,
                         modifiers: state.modifiers,
+                        pointer_type: crate::PointerType::Mouse,
+                        pressure: None,
                     });
                     drop(state);
                     window.handle_input(input);
@@ -1663,6 +1951,8 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandClientStatePtr {
                                 modifiers: state.modifiers,
                                 click_count: state.click.current_count,
                                 first_mouse: state.enter_token.take().is_some(),
+                                pointer_type: crate::PointerType::Mouse,
+                                pressure: None,
                             });
                             drop(state);
                             window.handle_input(input);
@@ -1677,6 +1967,8 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandClientStatePtr {
                                 position: state.mouse_location.unwrap(),
                                 modifiers: state.modifiers,
                                 click_count: state.click.current_count,
+                                pointer_type: crate::PointerType::Mouse,
+                                pressure: None,
                             });
                             drop(state);
                             window.handle_input(input);
@@ -2155,5 +2447,114 @@ impl Dispatch<zwp_primary_selection_source_v1::ZwpPrimarySelectionSourceV1, ()>
             }
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use zwp_tablet_tool_v2::Event;
+
+    fn feed(tool: &mut TabletToolState, events: Vec<Event>) -> Vec<String> {
+        events
+            .into_iter()
+            .flat_map(|event| tool.handle_event(event, Modifiers::default()))
+            .map(|input| match input {
+                PlatformInput::MouseMove(event) => {
+                    format!("move {:?} {:.2?}", event.pressed_button, event.pressure)
+                }
+                PlatformInput::MouseDown(event) => {
+                    format!("down {:?} {:.2?}", event.button, event.pressure)
+                }
+                PlatformInput::MouseUp(event) => format!("up {:?}", event.button),
+                other => format!("{other:?}"),
+            })
+            .collect()
+    }
+
+    fn motion(x: f64, y: f64) -> Event {
+        Event::Motion { x, y }
+    }
+
+    fn pressure(pressure: u32) -> Event {
+        Event::Pressure { pressure }
+    }
+
+    fn button(pressed: bool) -> Event {
+        Event::Button {
+            serial: 0,
+            button: 0x14b,
+            state: WEnum::Value(if pressed {
+                zwp_tablet_tool_v2::ButtonState::Pressed
+            } else {
+                zwp_tablet_tool_v2::ButtonState::Released
+            }),
+        }
+    }
+
+    const FRAME: Event = Event::Frame { time: 0 };
+
+    // Event sequences as KWin 6.8 sends them.
+    #[test]
+    fn test_tablet_stroke_uses_pressure_of_touch_frame() {
+        let mut tool = TabletToolState::default();
+        assert_eq!(
+            feed(&mut tool, vec![motion(245.0, 99.0), pressure(0), FRAME]),
+            ["move None Some(0.00)"]
+        );
+        assert_eq!(
+            feed(
+                &mut tool,
+                vec![
+                    motion(246.0, 99.0),
+                    Event::Down { serial: 0 },
+                    pressure(21896),
+                    FRAME
+                ]
+            ),
+            ["move None Some(0.33)", "down Left Some(0.33)"]
+        );
+        assert_eq!(
+            feed(
+                &mut tool,
+                vec![motion(247.0, 100.0), pressure(18436), FRAME]
+            ),
+            ["move Some(Left) Some(0.28)"]
+        );
+        assert_eq!(
+            feed(&mut tool, vec![Event::Up, pressure(0), FRAME]),
+            ["up Left"]
+        );
+        assert_eq!(
+            feed(&mut tool, vec![motion(248.0, 101.0), pressure(0), FRAME]),
+            ["move None Some(0.00)"]
+        );
+    }
+
+    #[test]
+    fn test_tablet_barrel_button_drags_with_middle_button() {
+        let mut tool = TabletToolState::default();
+        assert_eq!(
+            feed(
+                &mut tool,
+                vec![button(true), motion(10.0, 10.0), pressure(0), FRAME]
+            ),
+            ["move None Some(0.00)", "down Middle Some(0.00)"]
+        );
+        assert_eq!(
+            feed(&mut tool, vec![motion(20.0, 20.0), pressure(0), FRAME]),
+            ["move Some(Middle) Some(0.00)"]
+        );
+        assert_eq!(
+            feed(&mut tool, vec![button(false), motion(30.0, 30.0), FRAME]),
+            ["move Some(Middle) Some(0.00)", "up Middle"]
+        );
+        assert_eq!(
+            feed(
+                &mut tool,
+                vec![button(true), FRAME, Event::ProximityOut, FRAME]
+            ),
+            ["down Middle Some(0.00)", "up Middle"]
+        );
     }
 }

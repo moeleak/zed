@@ -733,6 +733,8 @@ impl VisualTestContext {
             position,
             modifiers,
             pressed_button: button.into(),
+            pointer_type: crate::PointerType::Mouse,
+            pressure: None,
         })
     }
 
@@ -749,6 +751,8 @@ impl VisualTestContext {
             button,
             click_count: 1,
             first_mouse: false,
+            pointer_type: crate::PointerType::Mouse,
+            pressure: None,
         })
     }
 
@@ -764,6 +768,8 @@ impl VisualTestContext {
             modifiers,
             button,
             click_count: 1,
+            pointer_type: crate::PointerType::Mouse,
+            pressure: None,
         })
     }
 
@@ -775,12 +781,16 @@ impl VisualTestContext {
             button: MouseButton::Left,
             click_count: 1,
             first_mouse: false,
+            pointer_type: crate::PointerType::Mouse,
+            pressure: None,
         });
         self.simulate_event(MouseUpEvent {
             position,
             modifiers,
             button: MouseButton::Left,
             click_count: 1,
+            pointer_type: crate::PointerType::Mouse,
+            pressure: None,
         });
     }
 

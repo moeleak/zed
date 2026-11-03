@@ -3634,6 +3634,8 @@ impl Window {
                         position,
                         pressed_button: Some(MouseButton::Left),
                         modifiers: Modifiers::default(),
+                        pointer_type: crate::PointerType::Mouse,
+                        pressure: None,
                     })
                 }
                 FileDropEvent::Pending { position } => {
@@ -3642,6 +3644,8 @@ impl Window {
                         position,
                         pressed_button: Some(MouseButton::Left),
                         modifiers: Modifiers::default(),
+                        pointer_type: crate::PointerType::Mouse,
+                        pressure: None,
                     })
                 }
                 FileDropEvent::Submit { position } => {
@@ -3652,6 +3656,8 @@ impl Window {
                         position,
                         modifiers: Modifiers::default(),
                         click_count: 1,
+                        pointer_type: crate::PointerType::Mouse,
+                        pressure: None,
                     })
                 }
                 FileDropEvent::Exited => {

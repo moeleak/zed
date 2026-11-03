@@ -88,6 +88,22 @@ pub enum TouchPhase {
     Ended,
 }
 
+/// The kind of device that generated a pointer event.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PointerType {
+    /// An ordinary mouse, trackpad or other non-pen pointer.
+    #[default]
+    Mouse,
+    /// The pen tip of a graphics tablet.
+    Pen,
+    /// The eraser end of a graphics tablet stylus.
+    PenEraser,
+    /// A touch screen or touchpad contact.
+    Touch,
+    /// The platform did not say.
+    Unknown,
+}
+
 /// A mouse down event from the platform
 #[derive(Clone, Debug, Default)]
 pub struct MouseDownEvent {
@@ -105,6 +121,12 @@ pub struct MouseDownEvent {
 
     /// Whether this is the first, focusing click.
     pub first_mouse: bool,
+
+    /// What kind of device generated the event.
+    pub pointer_type: PointerType,
+
+    /// Pen pressure normalized to 0.0..=1.0, when the device reports it.
+    pub pressure: Option<f32>,
 }
 
 impl Sealed for MouseDownEvent {}
@@ -129,6 +151,12 @@ pub struct MouseUpEvent {
 
     /// The number of times the button has been clicked.
     pub click_count: usize,
+
+    /// What kind of device generated the event.
+    pub pointer_type: PointerType,
+
+    /// Pen pressure normalized to 0.0..=1.0, when the device reports it.
+    pub pressure: Option<f32>,
 }
 
 impl Sealed for MouseUpEvent {}
@@ -331,6 +359,12 @@ pub struct MouseMoveEvent {
 
     /// The modifiers that were held down when the mouse was moved.
     pub modifiers: Modifiers,
+
+    /// What kind of device generated the event.
+    pub pointer_type: PointerType,
+
+    /// Pen pressure normalized to 0.0..=1.0, when the device reports it.
+    pub pressure: Option<f32>,
 }
 
 impl Sealed for MouseMoveEvent {}
@@ -464,6 +498,10 @@ pub struct MouseExitEvent {
     pub pressed_button: Option<MouseButton>,
     /// The modifiers that were held down when the mouse was moved.
     pub modifiers: Modifiers,
+    /// What kind of device generated the event.
+    pub pointer_type: PointerType,
+    /// Pen pressure normalized to 0.0..=1.0, when the device reports it.
+    pub pressure: Option<f32>,
 }
 
 impl Sealed for MouseExitEvent {}
