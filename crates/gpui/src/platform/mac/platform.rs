@@ -1,7 +1,7 @@
 use super::{
     BoolExt, MacKeyboardLayout, MacKeyboardMapper,
     attributed_string::{NSAttributedString, NSMutableAttributedString},
-    events::key_to_native,
+    events::{key_to_native, track_tablet_proximity},
     renderer,
 };
 use crate::{
@@ -75,6 +75,10 @@ unsafe fn build_classes() {
         APP_CLASS = {
             let mut decl = ClassDecl::new("GPUIApplication", class!(NSApplication)).unwrap();
             decl.add_ivar::<*mut c_void>(MAC_PLATFORM_IVAR);
+            decl.add_method(
+                sel!(sendEvent:),
+                send_event as extern "C" fn(&Object, Sel, id),
+            );
             decl.register()
         }
     };
@@ -1364,6 +1368,13 @@ unsafe fn get_mac_platform(object: &mut Object) -> &MacPlatform {
         let platform_ptr: *mut c_void = *object.get_ivar(MAC_PLATFORM_IVAR);
         assert!(!platform_ptr.is_null());
         &*(platform_ptr as *const MacPlatform)
+    }
+}
+
+extern "C" fn send_event(this: &Object, _: Sel, native_event: id) {
+    unsafe {
+        track_tablet_proximity(native_event);
+        let _: () = msg_send![super(this, class!(NSApplication)), sendEvent: native_event];
     }
 }
 

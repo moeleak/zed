@@ -10,12 +10,17 @@ use crate::{
 };
 use cocoa::{
     appkit::{NSEvent, NSEventModifierFlags, NSEventPhase, NSEventType},
-    base::{YES, id},
+    base::{BOOL, YES, id},
+    foundation::NSUInteger,
 };
 use core_foundation::data::{CFDataGetBytePtr, CFDataRef};
 use core_graphics::event::CGKeyCode;
 use objc::{msg_send, sel, sel_impl};
-use std::{borrow::Cow, ffi::c_void};
+use std::{
+    borrow::Cow,
+    ffi::c_void,
+    sync::atomic::{AtomicBool, Ordering},
+};
 
 const BACKSPACE_KEY: u16 = 0x7f;
 const SPACE_KEY: u16 = b' ' as u16;
@@ -24,6 +29,16 @@ const NUMPAD_ENTER_KEY: u16 = 0x03;
 pub(crate) const ESCAPE_KEY: u16 = 0x1b;
 const TAB_KEY: u16 = 0x09;
 const SHIFT_TAB_KEY: u16 = 0x19;
+
+// `cocoa`'s `NSEventSubtype` and `NSPointingDeviceType` don't have these values,
+// so tablet events are read with `msg_send!` rather than through its `NSEvent`.
+const NS_EVENT_SUBTYPE_TABLET_POINT: i16 = 1;
+const NS_EVENT_SUBTYPE_TABLET_PROXIMITY: i16 = 2;
+const NS_POINTING_DEVICE_TYPE_ERASER: NSUInteger = 3;
+
+/// Whether the stylus end near the tablet is the eraser. Pointer events don't
+/// say which end they come from, only the proximity event before them does.
+static TABLET_ERASER: AtomicBool = AtomicBool::new(false);
 
 pub fn key_to_native(key: &str) -> Cow<'_, str> {
     use cocoa::appkit::*;
@@ -100,6 +115,54 @@ unsafe fn read_modifiers(native_event: id) -> Modifiers {
     }
 }
 
+/// Must see every event the application receives: proximity events aren't tied
+/// to a window, as a stylus can come near the tablet anywhere on the screen.
+pub(crate) unsafe fn track_tablet_proximity(native_event: id) {
+    unsafe {
+        // Read as a number because not every event type is in `NSEventType`.
+        let event_type: NSUInteger = msg_send![native_event, type];
+        if event_type == NSEventType::NSTabletProximity as NSUInteger {
+            update_tablet_eraser(native_event);
+        }
+    }
+}
+
+unsafe fn update_tablet_eraser(proximity_event: id) {
+    unsafe {
+        let entering: BOOL = msg_send![proximity_event, isEnteringProximity];
+        let device_type: NSUInteger = msg_send![proximity_event, pointingDeviceType];
+        TABLET_ERASER.store(
+            entering == YES && device_type == NS_POINTING_DEVICE_TYPE_ERASER,
+            Ordering::Relaxed,
+        );
+    }
+}
+
+/// Tablets have no events of their own for the pen, they send mouse events with
+/// a subtype that marks the tablet data in them. Enter and exit events have no
+/// subtype, so they can't be passed here.
+unsafe fn read_pointer_type(native_event: id) -> PointerType {
+    unsafe {
+        let subtype: i16 = msg_send![native_event, subtype];
+        match subtype {
+            NS_EVENT_SUBTYPE_TABLET_POINT => {}
+            NS_EVENT_SUBTYPE_TABLET_PROXIMITY => update_tablet_eraser(native_event),
+            _ => return PointerType::Mouse,
+        }
+    }
+    if TABLET_ERASER.load(Ordering::Relaxed) {
+        PointerType::PenEraser
+    } else {
+        PointerType::Pen
+    }
+}
+
+/// The pressure of a mouse down, up or drag event, which only means something
+/// for a pen: a mouse reports a fixed value and a trackpad the force of a click.
+unsafe fn read_pressure(native_event: id, pointer_type: PointerType) -> Option<f32> {
+    (pointer_type != PointerType::Mouse).then(|| unsafe { native_event.pressure() })
+}
+
 impl PlatformInput {
     pub(crate) unsafe fn from_native(
         native_event: id,
@@ -148,6 +211,7 @@ impl PlatformInput {
                         _ => return None,
                     };
                     window_height.map(|window_height| {
+                        let pointer_type = read_pointer_type(native_event);
                         Self::MouseDown(MouseDownEvent {
                             button,
                             position: point(
@@ -158,8 +222,8 @@ impl PlatformInput {
                             modifiers: read_modifiers(native_event),
                             click_count: native_event.clickCount() as usize,
                             first_mouse: false,
-                            pointer_type: PointerType::Mouse,
-                            pressure: None,
+                            pointer_type,
+                            pressure: read_pressure(native_event, pointer_type),
                         })
                     })
                 }
@@ -177,6 +241,7 @@ impl PlatformInput {
                     };
 
                     window_height.map(|window_height| {
+                        let pointer_type = read_pointer_type(native_event);
                         Self::MouseUp(MouseUpEvent {
                             button,
                             position: point(
@@ -185,8 +250,8 @@ impl PlatformInput {
                             ),
                             modifiers: read_modifiers(native_event),
                             click_count: native_event.clickCount() as usize,
-                            pointer_type: PointerType::Mouse,
-                            pressure: None,
+                            pointer_type,
+                            pressure: read_pressure(native_event, pointer_type),
                         })
                     })
                 }
@@ -263,6 +328,7 @@ impl PlatformInput {
                     };
 
                     window_height.map(|window_height| {
+                        let pointer_type = read_pointer_type(native_event);
                         Self::MouseMove(MouseMoveEvent {
                             pressed_button: Some(pressed_button),
                             position: point(
@@ -270,12 +336,13 @@ impl PlatformInput {
                                 window_height - px(native_event.locationInWindow().y as f32),
                             ),
                             modifiers: read_modifiers(native_event),
-                            pointer_type: PointerType::Mouse,
-                            pressure: None,
+                            pointer_type,
+                            pressure: read_pressure(native_event, pointer_type),
                         })
                     })
                 }
                 NSEventType::NSMouseMoved => window_height.map(|window_height| {
+                    let pointer_type = read_pointer_type(native_event);
                     Self::MouseMove(MouseMoveEvent {
                         position: point(
                             px(native_event.locationInWindow().x as f32),
@@ -283,8 +350,9 @@ impl PlatformInput {
                         ),
                         pressed_button: None,
                         modifiers: read_modifiers(native_event),
-                        pointer_type: PointerType::Mouse,
-                        pressure: None,
+                        pointer_type,
+                        // `pressure` is undefined here, and a hovering pen presses nothing.
+                        pressure: (pointer_type != PointerType::Mouse).then_some(0.0),
                     })
                 }),
                 NSEventType::NSMouseExited => window_height.map(|window_height| {
